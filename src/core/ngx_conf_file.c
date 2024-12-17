@@ -5,6 +5,10 @@
  */
 
 
+#include "ngx_conf_file.h"
+#include "encrypt.h"
+#include "ngx_log.h"
+#include "ngx_string.h"
 #include <ngx_config.h>
 #include <ngx_core.h>
 
@@ -15,7 +19,8 @@ static ngx_int_t ngx_conf_handler(ngx_conf_t *cf, ngx_int_t last);
 static ngx_int_t ngx_conf_read_token(ngx_conf_t *cf);
 static void ngx_conf_flush_files(ngx_cycle_t *cycle);
 
-
+char *
+ngx_conf_encrypt_include(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 static ngx_command_t  ngx_conf_commands[] = {
 
     { ngx_string("include"),
@@ -24,7 +29,11 @@ static ngx_command_t  ngx_conf_commands[] = {
       0,
       0,
       NULL },
-
+    {
+        ngx_string("encrypt_include"),
+        NGX_ANY_CONF|NGX_CONF_TAKE1,
+        ngx_conf_encrypt_include,0,0,NULL,
+    },
       ngx_null_command
 };
 
@@ -344,6 +353,221 @@ done:
         cf->conf_file = prev;
     }
 
+    if (rc == NGX_ERROR) {
+        return NGX_CONF_ERROR;
+    }
+
+    return NGX_CONF_OK;
+}
+
+//with rsa decrypt
+char *
+ngx_conf_decrypt_parse(ngx_conf_t *cf, ngx_str_t *filename){
+    char             *rv;
+    ngx_fd_t          fd;
+    ngx_int_t         rc;
+    ngx_buf_t         buf;
+    ngx_conf_file_t  *prev, conf_file;
+    enum {
+        parse_file = 0,
+        parse_block,
+        parse_param
+    } type;
+
+#if (NGX_SUPPRESS_WARN)
+    fd = NGX_INVALID_FILE;
+    prev = NULL;
+#endif
+    char temp_filename[filename->len+5];
+    uint8_t need_remove=0;
+    if (filename) {
+
+        /* open configuration file */
+        ngx_log_error(NGX_LOG_INFO,cf->log,0,"read conf name %V",filename);
+
+        //decrypt zone
+        
+        ngx_memmove(temp_filename,filename->data,filename->len);
+        ngx_memmove(temp_filename+filename->len,".tmp",4);
+        temp_filename[filename->len+4]=0;
+        int ok=decrypt_conf_file(filename->data, filename->len);
+        if (ok!=0){
+            remove(temp_filename);
+            ngx_conf_log_error(NGX_LOG_ERR,cf,0,"decrypt configuration file %V failed",filename);
+            return NGX_CONF_ERROR;
+        }
+        need_remove=1;
+        //before decrypt conf file
+        fd = ngx_open_file(temp_filename, NGX_FILE_RDONLY, NGX_FILE_OPEN, 0);
+
+        if (fd == NGX_INVALID_FILE) {
+            remove((char*)temp_filename);
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                               ngx_open_file_n " \"%s\" failed",
+                               temp_filename);
+            return NGX_CONF_ERROR;
+        }
+
+        prev = cf->conf_file;
+
+        cf->conf_file = &conf_file;
+
+        if (ngx_fd_info(fd, &cf->conf_file->file.info) == NGX_FILE_ERROR) {
+            ngx_log_error(NGX_LOG_EMERG, cf->log, ngx_errno,
+                          ngx_fd_info_n " \"%s\" failed", temp_filename);
+        }
+
+        cf->conf_file->buffer = &buf;
+
+        buf.start = ngx_alloc(NGX_CONF_BUFFER, cf->log);
+        if (buf.start == NULL) {
+            goto failed;
+        }
+
+        buf.pos = buf.start;
+        buf.last = buf.start;
+        buf.end = buf.last + NGX_CONF_BUFFER;
+        buf.temporary = 1;
+
+        cf->conf_file->file.fd = fd;
+        cf->conf_file->file.name.len = filename->len+4;
+        cf->conf_file->file.name.data = (u_char*)temp_filename;
+        cf->conf_file->file.offset = 0;
+        cf->conf_file->file.log = cf->log;
+        cf->conf_file->line = 1;
+
+        type = parse_file;
+
+        if (ngx_dump_config
+#if (NGX_DEBUG)
+            || 1
+#endif
+           )
+        {
+            if (ngx_conf_add_dump(cf, filename) != NGX_OK) {
+                goto failed;
+            }
+
+        } else {
+            cf->conf_file->dump = NULL;
+        }
+
+    } else if (cf->conf_file->file.fd != NGX_INVALID_FILE) {
+
+        type = parse_block;
+
+    } else {
+        type = parse_param;
+    }
+
+
+    for ( ;; ) {
+        rc = ngx_conf_read_token(cf);
+
+        /*
+         * ngx_conf_read_token() may return
+         *
+         *    NGX_ERROR             there is error
+         *    NGX_OK                the token terminated by ";" was found
+         *    NGX_CONF_BLOCK_START  the token terminated by "{" was found
+         *    NGX_CONF_BLOCK_DONE   the "}" was found
+         *    NGX_CONF_FILE_DONE    the configuration file is done
+         */
+
+        if (rc == NGX_ERROR) {
+            goto done;
+        }
+
+        if (rc == NGX_CONF_BLOCK_DONE) {
+
+            if (type != parse_block) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "unexpected \"}\"");
+                goto failed;
+            }
+
+            goto done;
+        }
+
+        if (rc == NGX_CONF_FILE_DONE) {
+
+            if (type == parse_block) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "unexpected end of file, expecting \"}\"");
+                goto failed;
+            }
+
+            goto done;
+        }
+
+        if (rc == NGX_CONF_BLOCK_START) {
+
+            if (type == parse_param) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                                   "block directives are not supported "
+                                   "in -g option");
+                goto failed;
+            }
+        }
+
+        /* rc == NGX_OK || rc == NGX_CONF_BLOCK_START */
+
+        if (cf->handler) {
+
+            /*
+             * the custom handler, i.e., that is used in the http's
+             * "types { ... }" directive
+             */
+
+            if (rc == NGX_CONF_BLOCK_START) {
+                ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "unexpected \"{\"");
+                goto failed;
+            }
+
+            rv = (*cf->handler)(cf, NULL, cf->handler_conf);
+            if (rv == NGX_CONF_OK) {
+                continue;
+            }
+
+            if (rv == NGX_CONF_ERROR) {
+                goto failed;
+            }
+
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "%s", rv);
+
+            goto failed;
+        }
+
+
+        rc = ngx_conf_handler(cf, rc);
+
+        if (rc == NGX_ERROR) {
+            goto failed;
+        }
+    }
+
+failed:
+
+    rc = NGX_ERROR;
+
+done:
+
+    if (filename) {
+        if (cf->conf_file->buffer->start) {
+            ngx_free(cf->conf_file->buffer->start);
+        }
+
+        if (ngx_close_file(fd) == NGX_FILE_ERROR) {
+            ngx_log_error(NGX_LOG_ALERT, cf->log, ngx_errno,
+                          ngx_close_file_n " %s failed",
+                          filename->data);
+            rc = NGX_ERROR;
+        }
+
+        cf->conf_file = prev;
+    }
+    if (need_remove){
+        remove(temp_filename);
+    }
     if (rc == NGX_ERROR) {
         return NGX_CONF_ERROR;
     }
@@ -824,7 +1048,6 @@ ngx_conf_include(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     ngx_int_t    n;
     ngx_str_t   *value, file, name;
     ngx_glob_t   gl;
-
     value = cf->args->elts;
     file = value[1];
 
@@ -881,7 +1104,68 @@ ngx_conf_include(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 
     return rv;
 }
+char *
+ngx_conf_encrypt_include(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    char        *rv;
+    ngx_int_t    n;
+    ngx_str_t   *value, file, name;
+    ngx_glob_t   gl;
+    value = cf->args->elts;
+    file = value[1];
 
+    ngx_log_debug1(NGX_LOG_DEBUG_CORE, cf->log, 0, "include %s", file.data);
+
+    if (ngx_conf_full_name(cf->cycle, &file, 1) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+
+    if (strpbrk((char *) file.data, "*?[") == NULL) {
+
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, cf->log, 0, "include %s", file.data);
+
+        return ngx_conf_decrypt_parse(cf, &file);
+    }
+
+    ngx_memzero(&gl, sizeof(ngx_glob_t));
+
+    gl.pattern = file.data;
+    gl.log = cf->log;
+    gl.test = 1;
+
+    if (ngx_open_glob(&gl) != NGX_OK) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, ngx_errno,
+                           ngx_open_glob_n " \"%s\" failed", file.data);
+        return NGX_CONF_ERROR;
+    }
+
+    rv = NGX_CONF_OK;
+
+    for ( ;; ) {
+        n = ngx_read_glob(&gl, &name);
+        
+        if (n != NGX_OK) {
+            break;
+        }
+
+        file.len = name.len++;
+        file.data = ngx_pstrdup(cf->pool, &name);
+        if (file.data == NULL) {
+            return NGX_CONF_ERROR;
+        }
+        ngx_log_debug1(NGX_LOG_DEBUG_CORE, cf->log, 0, "include %s", file.data);
+
+        rv = ngx_conf_decrypt_parse(cf, &file);
+
+        if (rv != NGX_CONF_OK) {
+            break;
+        }
+    }
+
+    ngx_close_glob(&gl);
+
+    return rv;
+}
 
 ngx_int_t
 ngx_conf_full_name(ngx_cycle_t *cycle, ngx_str_t *name, ngx_uint_t conf_prefix)

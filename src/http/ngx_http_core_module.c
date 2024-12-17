@@ -3317,6 +3317,14 @@ ngx_http_core_type(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
         }
 
         return ngx_conf_include(cf, dummy, conf);
+    }else if (ngx_strcmp(value[0].data, "encrypt_include") == 0){
+        if (cf->args->nelts != 2) {
+            ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                               "invalid number of arguments"
+                               " in \"include\" directive");
+            return NGX_CONF_ERROR;
+        }
+        return ngx_conf_encrypt_include(cf, dummy, conf);
     }
 
     content_type = ngx_palloc(cf->pool, sizeof(ngx_str_t));

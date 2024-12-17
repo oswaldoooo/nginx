@@ -416,6 +416,8 @@ ngx_http_map(ngx_conf_t *cf, ngx_command_t *dummy, void *conf)
 
     if (ngx_strcmp(value[0].data, "include") == 0) {
         return ngx_conf_include(cf, dummy, conf);
+    }else if(ngx_strcmp(value[0].data,"encrypt_include")==0){
+        return ngx_conf_encrypt_include(cf,dummy,conf);
     }
 
     key = 0;
