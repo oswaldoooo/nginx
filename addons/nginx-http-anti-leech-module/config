@@ -1,0 +1,5 @@
+ngx_addon_name=ngx_http_anti_leech_module
+HTTP_FILTER_MODULES="$HTTP_FILTER_MODULES $ngx_addon_name"
+NGX_ADDON_SRCS="$NGX_ADDON_SRCS $ngx_addon_dir/ngx_http_anti_leech_module.c $ngx_addon_dir/base64.c"
+NGX_ADDON_DEPS="$NGX_ADDON_DEPS $ngx_addon_dir/base64.h"
+. auto/module
